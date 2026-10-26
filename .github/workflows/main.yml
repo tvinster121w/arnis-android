@@ -1,1 +1,91 @@
+name: Arnis Android APK
 
+# Put the ZIP (arnis-android.zip) in the repository root and this file at
+# .github/workflows/main.yml. The build starts by itself on upload, or by hand
+# from the Actions tab (Run workflow). The APK appears under Artifacts.
+on:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/main.yml"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project from the ZIP
+        run: |
+          zip=$(ls -1 *.zip 2>/dev/null | head -n 1)
+          if [ -z "$zip" ]; then
+            echo "::error::No .zip file in the repository root. Upload arnis-android.zip first."
+            exit 1
+          fi
+          echo "Using $zip"
+          rm -rf arnis && mkdir arnis
+          unzip -q "$zip" -d arnis
+          if [ ! -f arnis/Cargo.toml ]; then
+            found=$(find arnis -maxdepth 3 -name Cargo.toml | head -n 1)
+            if [ -z "$found" ]; then
+              echo "::error::Cargo.toml not found inside the ZIP."
+              exit 1
+            fi
+            mv "$(dirname "$found")" arnis-src && rm -rf arnis && mv arnis-src arnis
+          fi
+          ls arnis
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: arnis
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Create the Android project
+        working-directory: arnis
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo tauri android init --ci
+
+      - name: Allow saving worlds to Download/Arnis
+        working-directory: arnis
+        run: |
+          manifest=gen/android/app/src/main/AndroidManifest.xml
+          sed -i 's|<application|<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n    <application|' "$manifest"
+          grep -n "uses-permission" "$manifest"
+
+      - name: Build the APK (arm64)
+        working-directory: arnis
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo tauri android build --apk --target aarch64
+
+      - name: Sign the APK so it can be installed
+        working-directory: arnis
+        run: |
+          unsigned=$(find gen/android -name '*unsigned*.apk' | head -n 1)
+          echo "unsigned: $unsigned"
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          keytool -genkeypair -keystore ci.jks -storepass arnis123 -keypass arnis123 \
+            -alias arnis -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Arnis"
+          "$bt/zipalign" -p -f 4 "$unsigned" aligned.apk
+          "$bt/apksigner" sign --ks ci.jks --ks-pass pass:arnis123 --key-pass pass:arnis123 \
+            --out Arnis-android.apk aligned.apk
+          "$bt/apksigner" verify Arnis-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Arnis-android
+          path: arnis/Arnis-android.apk
